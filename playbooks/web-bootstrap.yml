@@ -1,0 +1,156 @@
+---
+- name: Bootstrap Picdam WEB servers from AWX
+  hosts: picdam_web
+  become: true
+  gather_facts: false
+
+  vars:
+    ansible_remote_tmp: /dev/shm/picdam-ansible-ubuntu
+    obs_dir: /run/picdam-web-obs
+    runtime_files:
+      - source_env: PICDAM_OBS_CONFIG_FILE
+        destination: /run/picdam-web-obs/config
+        owner: ubuntu
+      - source_env: PICDAM_OBS_CREDENTIALS_FILE
+        destination: /run/picdam-web-obs/credentials
+        owner: ubuntu
+      - source_env: PICDAM_COMPOSE_ENV_FILE
+        destination: /run/picdam-web/.env.web
+        owner: root
+
+  pre_tasks:
+    - name: Verify AWX runtime credential is attached
+      ansible.builtin.assert:
+        that:
+          - lookup('ansible.builtin.env', item.source_env) | length > 0
+        fail_msg: "Attach the picdam-web-runtime credential to this job."
+      loop: "{{ runtime_files }}"
+      run_once: true
+
+    - name: Wait for SSH and Python to become available
+      ansible.builtin.wait_for_connection:
+        timeout: 180
+        sleep: 5
+
+  tasks:
+    - name: Create the OBS runtime directory
+      ansible.builtin.file:
+        path: "{{ obs_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0700"
+
+    - name: Create the Compose runtime directory
+      ansible.builtin.file:
+        path: /run/picdam-web
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Deploy files supplied by AWX credentials
+      ansible.builtin.copy:
+        src: "{{ lookup('ansible.builtin.env', item.source_env) }}"
+        dest: "{{ item.destination }}"
+        owner: "{{ item.owner }}"
+        group: "{{ item.owner }}"
+        mode: "0600"
+        decrypt: false
+      loop: "{{ runtime_files }}"
+      no_log: true
+      diff: false
+
+    - name: Link Compose to the runtime environment
+      ansible.builtin.file:
+        src: /run/picdam-web/.env.web
+        dest: /opt/picdam-web/.env.web
+        state: link
+
+    - name: Verify OBS bucket access from the WEB server
+      ansible.builtin.command:
+        argv:
+          - aws
+          - --profile
+          - ktcloud
+          - --endpoint-url
+          - https://obj-e-1.ktcloud.com
+          - s3api
+          - list-objects-v2
+          - --bucket
+          - "{{ item }}"
+          - --prefix
+          - web/
+          - --max-keys
+          - "1"
+          - --no-paginate
+          - --query
+          - KeyCount
+          - --output
+          - text
+      environment:
+        AWS_CONFIG_FILE: "{{ obs_dir }}/config"
+        AWS_SHARED_CREDENTIALS_FILE: "{{ obs_dir }}/credentials"
+      loop:
+        - nc-access-logs
+        - nc-application-logs
+      changed_when: false
+
+    - name: Create the log shipper drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/picdam-web-log-shipper.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure the log shipper runtime profile
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/picdam-web-log-shipper.service.d/obs-profile.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Service]
+          Environment="AWS_PROFILE=ktcloud"
+          Environment="AWS_CONFIG_FILE=/run/picdam-web-obs/config"
+          Environment="AWS_SHARED_CREDENTIALS_FILE=/run/picdam-web-obs/credentials"
+      notify: Reload systemd
+
+    - name: Apply systemd configuration before starting the timer
+      ansible.builtin.meta: flush_handlers
+
+    - name: Validate Compose configuration
+      ansible.builtin.command:
+        cmd: docker compose --env-file .env.web -f compose.yaml config --quiet
+        chdir: /opt/picdam-web
+      changed_when: false
+      no_log: true
+
+    - name: Start WEB containers using local Docker images
+      ansible.builtin.command:
+        cmd: >-
+          docker compose --env-file .env.web -f compose.yaml
+          up -d --no-build --pull never --wait --wait-timeout 120
+        chdir: /opt/picdam-web
+
+    - name: Check the WEB root through NGINX
+      ansible.builtin.uri:
+        url: http://127.0.0.1/
+        status_code: 200
+        return_content: false
+      register: web_health
+      retries: 6
+      delay: 5
+      until: web_health.status == 200
+
+    - name: Enable the periodic log shipper
+      ansible.builtin.systemd_service:
+        name: picdam-web-log-shipper.timer
+        enabled: true
+        state: started
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
